@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   evolution-manager:
     build:
@@ -17,50 +15,61 @@ services:
   # Optional: Include Evolution API for complete stack
   # Uncomment the section below if you want to run Evolution API alongside the manager
 
-  # evolution-api:
-  #   image: evolutionapi/evolution-api:latest
-  #   ports:
-  #     - "8080:8080"
-  #   container_name: evolution-api
-  #   restart: unless-stopped
-  #   environment:
-  #     - DATABASE_PROVIDER=postgresql
-  #     - DATABASE_CONNECTION_URI=postgresql://postgres:password@postgres:5432/evolution
-  #     - AUTHENTICATION_API_KEY=your-api-key-here
-  #     - SERVER_PORT=8080
-  #   depends_on:
-  #     - postgres
-  #     - redis
-  #   networks:
-  #     - evolution-network
+  evolution-api:
+    # Official image is evoapicloud/evolution-api (see the upstream
+    # EvolutionAPI/evolution-api docker-compose.yaml). The old
+    # evolutionapi/evolution-api repository does not exist on Docker Hub.
+    image: evoapicloud/evolution-api:v2.3.7
+    ports:
+      - "8080:8080"
+    container_name: evolution-api
+    restart: unless-stopped
+    environment:
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://postgres:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/evolution?schema=evolution_api
+      - AUTHENTICATION_API_KEY=${AUTHENTICATION_API_KEY:?AUTHENTICATION_API_KEY not set}
+      - SERVER_PORT=8080
+      - CACHE_REDIS_ENABLED=true
+      - CACHE_REDIS_URI=redis://redis:6379/6
+      - CACHE_REDIS_PREFIX_KEY=evolution
+    volumes:
+      # WhatsApp instance/session state. Without this, every container
+      # recreate loses all connected instances and forces a re-scan.
+      - evolution_instances:/evolution/instances
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - evolution-network
 
-  # postgres:
-  #   image: postgres:15-alpine
-  #   container_name: evolution-postgres
-  #   restart: unless-stopped
-  #   environment:
-  #     - POSTGRES_DB=evolution
-  #     - POSTGRES_USER=postgres
-  #     - POSTGRES_PASSWORD=password
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #   ports:
-  #     - "5432:5432"
-  #   networks:
-  #     - evolution-network
+  postgres:
+    image: postgres:15-alpine
+    container_name: evolution-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=evolution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Not published to the host: only evolution-api needs it, over the internal
+    # bridge network. For local psql access, bind loopback: "127.0.0.1:5432:5432"
+    networks:
+      - evolution-network
 
-  # redis:
-  #   image: redis:7-alpine
-  #   container_name: evolution-redis
-  #   restart: unless-stopped
-  #   ports:
-  #     - "6379:6379"
-  #   networks:
-  #     - evolution-network
+  redis:
+    image: redis:7-alpine
+    container_name: evolution-redis
+    restart: unless-stopped
+    # Not published to the host: no auth is configured, so an exposed port is an
+    # unauthenticated Redis. Reachable as redis:6379 on the internal network.
+    networks:
+      - evolution-network
 
 networks:
   evolution-network:
     driver: bridge
 
-# volumes:
-#   postgres_data:
+volumes:
+  postgres_data:
+  evolution_instances:
