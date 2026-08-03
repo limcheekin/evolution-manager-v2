@@ -15,8 +15,8 @@ COPY tsconfig.json ./
 COPY tsconfig.app.json ./
 COPY tsconfig.node.json ./
 COPY vite.config.ts ./
-COPY postcss.config.js ./
-COPY tailwind.config.js ./
+# No tailwind.config.js / postcss.config.js: Tailwind v4 is wired through the
+# @tailwindcss/vite plugin in vite.config.ts, not a standalone config.
 COPY index.html ./
 COPY components.json ./
 COPY public/ ./public/
