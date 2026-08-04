@@ -186,7 +186,12 @@ Both secrets reach the VM through cloud-init user-data and are written to `/opt/
 | 8 | `SERVER_URL` | `.manager` contains this host, not localhost |
 | 9 | **Redis AOF** | `appendonly yes` — the §4 fix |
 | 10 | NSG exposure | 5432, 6379, 8080, 3000 **not** open |
+| 10b | no NIC-level NSG | NIC has none; the subnet NSG governs |
 | 11 | backup | protected, or explicitly disabled by choice |
+
+Check 10b exists because the two NSG layers fail asymmetrically. The NSG is attached to the subnet and `az vm create --nsg ""` means "none" at the NIC. If a NIC-level NSG ever did appear, its defaults allow SSH only, so Caddy's 80/443/8443 would be blocked *at the NIC* while check 10 — which reads the subnet's rules — still passed. Checks 3 through 7 would then fail with nothing pointing at the cause.
+
+Checks 2 and 9, plus phase 3's readiness loop and `logs`, go through `az vm run-command` rather than SSH, so they work with port 22 closed. `vm_run` extracts the script's output from the `[stdout]`/`[stderr]` framing that command returns; if that framing ever changes it falls back to printing the raw message, so a parsing problem cannot masquerade as "no containers running".
 
 ---
 
@@ -280,4 +285,13 @@ Checked rather than recalled:
 - All prices: Azure Retail Prices API cross-checked against `azure.microsoft.com/api/v3/pricing/*/calculator/`, the calculator's own data source.
 - The generated overlay merges as intended: `docker compose config` over `docker-compose.yml` + `docker-compose.prod.yml`, confirming env precedence, Redis AOF, and all five volumes.
 
-**Not verified:** no VM has been created from this script. The 4 GiB memory fit, the on-VM manager build under swap, ACME issuance against the Azure FQDN, and ARM64 capacity actually being allocatable at `create` time are all untested until first deploy. Egress volume is unmeasured.
+- `az vm create --nsg ""` is the documented way to request no NIC-level NSG (`az vm create --help`: *specify `""` for none*). Under PowerShell that argument needs `'""'`; the script is bash.
+
+**Not verified — no VM has been created from this script.** Untested until first deploy:
+
+- the 4 GiB memory fit with all five containers plus the manager build
+- the on-VM `tsc -b && vite build` surviving under the 2 GiB swapfile
+- ACME issuance against the `*.cloudapp.azure.com` FQDN
+- ARM64 capacity actually being allocatable at `create` time (unrestricted and in-quota is necessary, not sufficient)
+- the `[stdout]`/`[stderr]` framing `vm_run` parses out of `az vm run-command` — every use of it in development was against a VM that did not exist, which is why it now falls back to the raw message
+- egress volume, and therefore whether the 100 GB/month free allowance holds

@@ -550,6 +550,10 @@ phase_2() {
       --vnet-name "$VNET_NAME" \
       --subnet "$SUBNET_NAME" \
       --public-ip-address "$PUBLIC_IP_NAME" \
+      `# "" means "no NIC-level NSG" (documented for --nsg). The NSG is on the` \
+      `# subnet instead. A NIC-level NSG would override it and, with its` \
+      `# SSH-only defaults, would block Caddy on 80/443/8443. Note: under` \
+      `# PowerShell this argument needs '""' rather than "".` \
       --nsg "" \
       --custom-data "$CLOUDINIT_FILE" \
       --output none
@@ -591,10 +595,23 @@ phase_3() {
 vm_run() {
   # Run a command on the VM. Uses `az vm run-command`, so it works even when
   # port 22 is closed by the NSG.
-  az vm run-command invoke -g "$RG" -n "$VM_NAME" \
-    --command-id RunShellScript --scripts "$1" \
-    --query 'value[0].message' -o tsv 2>/dev/null \
-    | sed -n '/\[stdout\]/,/\[stderr\]/p' | sed '1d;$d'
+  #
+  # The message comes back as a single field wrapping the script's output in
+  # [stdout]/[stderr] delimiters. If that framing ever changes, the extraction
+  # below yields nothing — and callers (phase 3's readiness loop, verify checks
+  # 2 and 9) would then report a healthy VM as broken. So fall back to the raw
+  # message rather than returning empty: a parsing problem should look like a
+  # parsing problem, not a deployment failure.
+  local raw extracted
+  raw="$(az vm run-command invoke -g "$RG" -n "$VM_NAME" \
+          --command-id RunShellScript --scripts "$1" \
+          --query 'value[0].message' -o tsv 2>/dev/null || true)"
+  extracted="$(sed -n '/\[stdout\]/,/\[stderr\]/p' <<<"$raw" | sed '1d;$d')"
+  if [[ -n "${extracted//[[:space:]]/}" ]]; then
+    printf '%s\n' "$extracted"
+  else
+    printf '%s\n' "$raw"
+  fi
 }
 
 # ------------------------------------------------------- phase 4: backup ----
@@ -701,6 +718,25 @@ cmd_verify() {
     fail "NSG allows $open — 5432/6379/8080/3000 must not be open"
   else
     ok "only $open open"
+  fi
+
+  step "10b. no second NSG on the NIC"
+  # The NSG is attached to the SUBNET; `az vm create --nsg ""` means "none"
+  # (documented). If a NIC-level NSG ever appears anyway, its default rules
+  # allow SSH only, so Caddy's 80/443/8443 would be blocked at the NIC while
+  # check 10 above still passes — checks 3 through 7 would fail with no
+  # indication of why. Assert it directly.
+  local nic_id nic_nsg
+  nic_id="$(az vm show -g "$RG" -n "$VM_NAME" \
+             --query 'networkProfile.networkInterfaces[0].id' -o tsv 2>/dev/null || true)"
+  if [[ -z "$nic_id" ]]; then
+    fail "could not resolve the VM's NIC"
+  else
+    nic_nsg="$(az network nic show --ids "$nic_id" \
+                --query 'networkSecurityGroup.id' -o tsv 2>/dev/null || true)"
+    [[ -z "$nic_nsg" || "$nic_nsg" == "None" ]] \
+      && ok "NIC has no NSG; subnet NSG governs" \
+      || fail "a NIC-level NSG exists ($(basename "$nic_nsg")) and will override the subnet rules"
   fi
 
   step "11. backup"
