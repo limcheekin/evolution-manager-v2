@@ -528,8 +528,23 @@ CLOUDINIT
     -e "s|@@GIT_REF@@|${MANAGER_GIT_REF}|g" \
     -e "s|@@PG_PASSWORD@@|${POSTGRES_PASSWORD}|g" \
     -e "s|@@API_KEY@@|${AUTHENTICATION_API_KEY}|g" \
-    -e "s|@@ACR_LOGIN@@|${acr_login:-true}|g" \
     "$CLOUDINIT_FILE"
+
+  # The docker-login step only exists in ACR mode. Substituting a no-op like
+  # `true` here would be a bare YAML boolean, and cloud-init's shellify() raises
+  # TypeError on a non-string runcmd entry — which aborts the ENTIRE runcmd
+  # module, not just that line. Delete the line instead.
+  if [[ -n "$acr_login" ]]; then
+    sed -i "s|@@ACR_LOGIN@@|${acr_login}|g" "$CLOUDINIT_FILE"
+  else
+    sed -i '/@@ACR_LOGIN@@/d' "$CLOUDINIT_FILE"
+  fi
+
+  # Guard against the same class of bug returning: any runcmd/bootcmd entry that
+  # YAML would type as a boolean or null rather than a string.
+  if grep -nE '^[[:space:]]*-[[:space:]]*(true|false|True|False|TRUE|FALSE|yes|no|on|off|null|~)[[:space:]]*$' "$CLOUDINIT_FILE"; then
+    die "rendered cloud-init contains a bare YAML boolean/null list item (shown above); cloud-init would fail to shellify runcmd"
+  fi
 
   # The manager override is multi-line and indentation-sensitive, so it is
   # spliced in with awk (sed would mangle the embedded newlines). An empty
@@ -742,17 +757,22 @@ cmd_verify() {
   # allow SSH only, so Caddy's 80/443/8443 would be blocked at the NIC while
   # check 10 above still passes — checks 3 through 7 would fail with no
   # indication of why. Assert it directly.
-  local nic_id nic_nsg
+  # Resolved by name rather than with --ids: under Git Bash / MSYS, an argument
+  # beginning with '/' is rewritten into a Windows path, so
+  # `--ids /subscriptions/...` arrives as `C:/Program Files/Git/subscriptions/...`
+  # and az rejects it as an invalid resource ID.
+  local nic_id nic_name nic_nsg
   nic_id="$(az vm show -g "$RG" -n "$VM_NAME" \
              --query 'networkProfile.networkInterfaces[0].id' -o tsv 2>/dev/null || true)"
-  if [[ -z "$nic_id" ]]; then
+  nic_name="${nic_id##*/}"
+  if [[ -z "$nic_name" ]]; then
     fail "could not resolve the VM's NIC"
   else
-    nic_nsg="$(az network nic show --ids "$nic_id" \
+    nic_nsg="$(az network nic show -g "$RG" -n "$nic_name" \
                 --query 'networkSecurityGroup.id' -o tsv 2>/dev/null || true)"
     [[ -z "$nic_nsg" || "$nic_nsg" == "None" ]] \
-      && ok "NIC has no NSG; subnet NSG governs" \
-      || fail "a NIC-level NSG exists ($(basename "$nic_nsg")) and will override the subnet rules"
+      && ok "NIC $nic_name has no NSG; subnet NSG governs" \
+      || fail "a NIC-level NSG exists (${nic_nsg##*/}) and will override the subnet rules"
   fi
 
   step "11. backup"
