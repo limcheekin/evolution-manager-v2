@@ -162,3 +162,9 @@ temp/
 .secrets.deploy
 evolution-api.yaml
 evolution-manager.yaml
+
+# VM deployment artifacts (docs/azure-vm-deploy.sh). The rendered cloud-init
+# embeds the Postgres password and the Evolution API key in plaintext.
+.secrets.*
+cloud-init.rendered.yaml
+qr.png
