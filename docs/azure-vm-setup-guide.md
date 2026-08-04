@@ -131,6 +131,8 @@ Two more inherited behaviours:
 
 `SERVER_URL` is knowable up front here, unlike on Container Apps: the DNS label is created in phase 1, before the VM exists. The two-revision dance of that guide's §9 disappears.
 
+**`SERVER_TYPE` must stay `http`, and the `manager` field will read `http://`.** Confirmed on a live deployment: `GET /` returns `"manager": "http://<host>/manager"` even though `SERVER_URL` is `https://<host>` inside the container. That field is built from `SERVER_TYPE` plus the `Host` header, not from `SERVER_URL`. Do not "fix" it by setting `SERVER_TYPE=https` — that makes the app terminate TLS itself and expect certificate files, which breaks the Caddy setup. Webhook payloads and Chatwoot/Meta callbacks use `SERVER_URL` and correctly carry `https://`. The discrepancy is cosmetic. (Note that the Container Apps guide's §7.4 sample output shows `https://` for this field; expect `http://` behind any TLS-terminating proxy.)
+
 ---
 
 ## 6. Prerequisites
@@ -184,6 +186,7 @@ Both secrets reach the VM through cloud-init user-data and are written to `/opt/
 | 6 | CORS preflight from the manager origin | `access-control-allow-origin` present |
 | 7 | manager on :8443 | `200` on `/health` |
 | 8 | `SERVER_URL` | `.manager` contains this host, not localhost |
+
 | 9 | **Redis AOF** | `appendonly yes` — the §4 fix |
 | 10 | NSG exposure | 5432, 6379, 8080, 3000 **not** open |
 | 10b | no NIC-level NSG | NIC has none; the subnet NSG governs |
@@ -287,11 +290,20 @@ Checked rather than recalled:
 
 - `az vm create --nsg ""` is the documented way to request no NIC-level NSG (`az vm create --help`: *specify `""` for none*). Under PowerShell that argument needs `'""'`; the script is bash.
 
-**Not verified — no VM has been created from this script.** Untested until first deploy:
+**Confirmed on a live deployment** (`Standard_B2pls_v2`, southeastasia, 2026-08-04) — all 12 `verify` checks passed:
 
-- the 4 GiB memory fit with all five containers plus the manager build
-- the on-VM `tsc -b && vite build` surviving under the 2 GiB swapfile
-- ACME issuance against the `*.cloudapp.azure.com` FQDN
-- ARM64 capacity actually being allocatable at `create` time (unrestricted and in-quota is necessary, not sufficient)
-- the `[stdout]`/`[stderr]` framing `vm_run` parses out of `az vm run-command` — every use of it in development was against a VM that did not exist, which is why it now falls back to the raw message
+- ARM64 capacity was allocatable at `create` time
+- all four upstream images pulled for arm64, including `evolution-api:v2.3.7` (1.75 GB)
+- the on-VM `npm ci` + `tsc -b && vite build` completed; 2 GiB swap was enabled and barely touched (~3.0 GiB of 3.9 GiB still available with all five containers up)
+- Let's Encrypt issued a certificate for the `*.cloudapp.azure.com` FQDN over HTTP-01
+- five containers running; API returns `version: 2.3.7`; key enforced (401/200); CORS allow-origin present; manager 200 on `:8443`; Redis `appendonly yes`
+- the NIC carries no NSG, so subnet rules govern
+- egress to `web.whatsapp.com` works — `GET /` populates `whatsappWebVersion`
+- `az vm run-command` does return the `[stdout]`/`[stderr]` framing `vm_run` parses
+
+**Still not verified:**
+
 - egress volume, and therefore whether the 100 GB/month free allowance holds
+- a restore from any backup (backup was declined on this deployment)
+- behaviour across a VM reboot — the §4 durability claim is structurally sound (named volume + AOF) but has not been exercised by an actual restart
+- long-term certificate renewal

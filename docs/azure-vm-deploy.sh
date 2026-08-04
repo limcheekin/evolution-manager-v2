@@ -358,10 +358,7 @@ write_files:
   - path: @@APP_DIR@@/Caddyfile
     permissions: '0644'
     content: |
-      {
-        email @@ADMIN_EMAIL@@
-      }
-
+@@CADDY_GLOBAL@@
       # Evolution API at the root of the host. SERVER_URL points here, so
       # webhook payloads and any Chatwoot/Meta callbacks carry a URL that
       # actually resolves.
@@ -519,11 +516,23 @@ CLOUDINIT
   # not guarantee, so create it up front via a bootcmd inserted here.
   sed -i "1a bootcmd:\n  - mkdir -p ${APP_DIR}" "$CLOUDINIT_FILE"
 
+  # Caddy's global options block exists only to carry the ACME contact address.
+  # An empty `email` directive is a hard config error ("wrong argument count"),
+  # which crash-loops Caddy and leaves the whole site without TLS, so when no
+  # address is configured the block is omitted entirely rather than emitted
+  # empty. ACME still works without a contact address.
+  local caddy_global=""
+  if [[ -n "${ADMIN_EMAIL// /}" ]]; then
+    caddy_global=$'      {\n        email '"${ADMIN_EMAIL}"$'\n      }\n'
+  fi
+  awk -v repl="$caddy_global" \
+    '{ if ($0 ~ /@@CADDY_GLOBAL@@/) { if (repl != "") print repl } else print }' \
+    "$CLOUDINIT_FILE" > "${CLOUDINIT_FILE}.tmp" && mv "${CLOUDINIT_FILE}.tmp" "$CLOUDINIT_FILE"
+
   sed -i \
     -e "s|@@APP_DIR@@|${APP_DIR}|g" \
     -e "s|@@SITE_HOST@@|${SITE_HOST}|g" \
     -e "s|@@TZ_VALUE@@|${TZ_VALUE}|g" \
-    -e "s|@@ADMIN_EMAIL@@|${ADMIN_EMAIL}|g" \
     -e "s|@@REPO_URL@@|${MANAGER_REPO}|g" \
     -e "s|@@GIT_REF@@|${MANAGER_GIT_REF}|g" \
     -e "s|@@PG_PASSWORD@@|${POSTGRES_PASSWORD}|g" \
