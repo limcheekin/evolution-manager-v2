@@ -152,12 +152,28 @@ phase_1() {
   step "building ${MANAGER_IMAGE_NAME}:${MANAGER_IMAGE_TAG} from ${MANAGER_GIT_REF}"
   # The .git suffix is mandatory — without it the CLI treats the URL as a
   # remote tarball and the build fails confusingly.
-  az acr build \
+  #
+  # --no-logs is a Windows workaround, not a behaviour change. az.cmd starts
+  # Python in isolated mode (-I implies -E), so PYTHONIOENCODING / PYTHONUTF8 are
+  # ignored and sys.stdout stays cp1252. The Vite build log contains U+2713,
+  # which makes the CLI's log streamer (acr/_stream_utils.py) die with
+  # UnicodeEncodeError *after* ACR has already built and pushed the image — a
+  # non-zero exit for a build that actually succeeded. --no-format does not help;
+  # it only bypasses colorama, not the cp1252 stdout.
+  #
+  # --no-logs still polls to a terminal state (unlike --no-wait) and still
+  # reports a genuine build failure, which the status assertion below catches.
+  # To read build logs, use the printed run ID from a UTF-8 console or the portal:
+  #   az acr task logs -r "$ACR_NAME" --run-id <runId>
+  local build_result
+  build_result="$(az acr build \
     --registry "$ACR_NAME" \
     --image "${MANAGER_IMAGE_NAME}:${MANAGER_IMAGE_TAG}" \
     --file Dockerfile \
-    "${MANAGER_REPO}#${MANAGER_GIT_REF}"
-  ok "image pushed"
+    --no-logs -o json \
+    "${MANAGER_REPO}#${MANAGER_GIT_REF}" | jq -r '.runId + " " + .status')"
+  [[ "$build_result" == *" Succeeded" ]] || die "acr build failed: run $build_result"
+  ok "image pushed (run $build_result)"
 
   az acr repository show-tags -n "$ACR_NAME" --repository "$MANAGER_IMAGE_NAME" -o table
 }
@@ -482,6 +498,16 @@ cmd_verify() {
   load_env; preflight; api_facts; manager_facts
   local fails=0
 
+  # Every check below must run even when an earlier one fails, so that the
+  # operator sees all 8 results. Two things fight that under `set -e`:
+  #   - `((fails++))` evaluates to the OLD value, so the first increment (0)
+  #     makes the arithmetic command exit 1 and kills the script. Use an
+  #     assignment, which is always exit 0.
+  #   - a value capture whose command fails (curl exit 7 on connection refused,
+  #     az on a missing resource) propagates that status. Guard each with
+  #     `|| true` and let the comparison below report the miss.
+  fail() { warn "$*"; fails=$((fails + 1)); }
+
   step "waiting for API to answer (up to 180s)"
   local i
   for i in $(seq 1 36); do
@@ -493,18 +519,18 @@ cmd_verify() {
   if curl -fsS --max-time 20 "$API_URL" | jq -e '.version' >/dev/null 2>&1; then
     ok "version $(curl -fsS --max-time 20 "$API_URL" | jq -r .version)"
   else
-    warn "no JSON from $API_URL (may still be migrating, or egress to web.whatsapp.com is blocked)"; ((fails++))
+    fail "no JSON from $API_URL (may still be migrating, or egress to web.whatsapp.com is blocked)"
   fi
 
   step "2. API key enforced"
   local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$API_URL/instance/fetchInstances")"
-  if [[ "$code" == "401" ]]; then ok "401 without key"; else warn "expected 401, got $code"; ((fails++)); fi
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$API_URL/instance/fetchInstances" || true)"
+  if [[ "$code" == "401" ]]; then ok "401 without key"; else fail "expected 401, got ${code:-<no response>}"; fi
 
   step "3. API key accepted"
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
-    -H "apikey: $AUTHENTICATION_API_KEY" "$API_URL/instance/fetchInstances")"
-  if [[ "$code" == "200" ]]; then ok "200 with key"; else warn "expected 200, got $code"; ((fails++)); fi
+    -H "apikey: $AUTHENTICATION_API_KEY" "$API_URL/instance/fetchInstances" || true)"
+  if [[ "$code" == "200" ]]; then ok "200 with key"; else fail "expected 200, got ${code:-<no response>}"; fi
 
   step "4. CORS preflight from manager origin"
   if curl -s -I --max-time 15 -X OPTIONS "$API_URL/instance/fetchInstances" \
@@ -512,27 +538,27 @@ cmd_verify() {
       -H "Access-Control-Request-Headers: apikey" | grep -qi 'access-control-allow-origin'; then
     ok "allow-origin present"
   else
-    warn "no access-control-allow-origin — check CORS_ORIGIN"; ((fails++))
+    fail "no access-control-allow-origin — check CORS_ORIGIN"
   fi
 
   step "5. Manager health"
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$MANAGER_URL/health")"
-  if [[ "$code" == "200" ]]; then ok "200"; else warn "expected 200, got $code"; ((fails++)); fi
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$MANAGER_URL/health" || true)"
+  if [[ "$code" == "200" ]]; then ok "200"; else fail "expected 200, got ${code:-<no response>}"; fi
 
   step "6. Replica pinned to 1"
   local mn mx
-  mn="$(az containerapp show -g "$RG" -n "$API_APP" --query properties.template.scale.minReplicas -o tsv)"
-  mx="$(az containerapp show -g "$RG" -n "$API_APP" --query properties.template.scale.maxReplicas -o tsv)"
-  if [[ "$mn" == "1" && "$mx" == "1" ]]; then ok "min=1 max=1"; else warn "min=$mn max=$mx — must be 1/1"; ((fails++)); fi
+  mn="$(az containerapp show -g "$RG" -n "$API_APP" --query properties.template.scale.minReplicas -o tsv || true)"
+  mx="$(az containerapp show -g "$RG" -n "$API_APP" --query properties.template.scale.maxReplicas -o tsv || true)"
+  if [[ "$mn" == "1" && "$mx" == "1" ]]; then ok "min=1 max=1"; else fail "min=${mn:-?} max=${mx:-?} — must be 1/1"; fi
 
   step "7. Both containers present"
   local names
   names="$(az containerapp show -g "$RG" -n "$API_APP" \
-    --query 'properties.template.containers[].name' -o tsv | sort | tr '\n' ' ')"
+    --query 'properties.template.containers[].name' -o tsv 2>/dev/null | sort | tr '\n' ' ' || true)"
   if [[ "$names" == *"evolution-api"* && "$names" == *"redis"* ]]; then
     ok "$names"
   else
-    warn "unexpected containers: $names"; ((fails++))
+    fail "unexpected containers: ${names:-<none>}"
   fi
 
   step "8. Secrets not stored as plaintext env values"
@@ -541,7 +567,7 @@ cmd_verify() {
                | select(.name=="AUTHENTICATION_API_KEY") | has("secretRef")' >/dev/null 2>&1; then
     ok "AUTHENTICATION_API_KEY uses secretRef"
   else
-    warn "AUTHENTICATION_API_KEY is not a secretRef"; ((fails++))
+    fail "AUTHENTICATION_API_KEY is not a secretRef"
   fi
 
   printf '\n'

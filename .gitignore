@@ -154,3 +154,11 @@ build/
 # Temporary files
 tmp/
 temp/
+
+# Azure deployment artifacts (docs/azure-deploy.sh writes these next to itself).
+# The rendered YAML manifests inline the Postgres password and the Evolution
+# API key in plaintext. Never commit any of them.
+.env.deploy
+.secrets.deploy
+evolution-api.yaml
+evolution-manager.yaml

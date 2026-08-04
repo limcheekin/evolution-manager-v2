@@ -1,2 +1,10 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts must stay LF even on Windows checkouts. With core.autocrlf=true
+# the rule above rewrites them to CRLF, and bash then fails on the shebang line
+# with: /usr/bin/env: 'bash\r': No such file or directory
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
