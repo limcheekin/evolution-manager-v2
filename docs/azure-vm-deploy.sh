@@ -57,10 +57,26 @@ cmd_init() {
 
     # SSH is locked to one source address. Detected here so the NSG rule in
     # phase 1 is narrow by default rather than 0.0.0.0/0.
-    admin_ip="$(curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    #
+    # Forced to IPv4 (-4) and tried against several endpoints: the public IP is
+    # IPv4, so the NSG rule must carry an IPv4 source or it will never match.
+    # On a dual-stack client an unforced curl returns the IPv6 address, and
+    # api.ipify.org alone is not reliable — it is unreachable over IPv4 from
+    # some networks.
+    local svc
+    admin_ip=""
+    for svc in https://ifconfig.me/ip https://icanhazip.com \
+               https://checkip.amazonaws.com https://api.ipify.org; do
+      admin_ip="$(curl -4 -fsS --max-time 8 "$svc" 2>/dev/null | tr -d '[:space:]' || true)"
+      [[ "$admin_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && break
+      admin_ip=""
+    done
     if [[ -z "$admin_ip" ]]; then
-      warn "could not detect your public IP; SSH will be left closed"
+      warn "could not detect your public IPv4; SSH will be left closed"
+      warn "set ADMIN_SOURCE_IP in $ENV_FILE and re-run phase 1 to open it"
       admin_ip="none"
+    else
+      ok "detected public IPv4 $admin_ip (SSH will be limited to it)"
     fi
 
     # ---- the one interactive decision: Azure Backup ----
@@ -212,8 +228,8 @@ check_capacity() {
   (( reg_lim - reg_used >= 2 )) || die "no regional vCPU headroom for 2 vCPUs"
   ok "capacity available"
 
-  exists az vm list-skus -l "$LOCATION" --size "$VM_SIZE" \
-    --query "[?name=='${VM_SIZE}' && length(restrictions)==\`0\`]" || true
+  # One call only: `az vm list-skus` fetches the whole regional SKU catalogue
+  # and takes 1-5 minutes, so it is not something to invoke twice.
   local restr
   restr="$(az vm list-skus -l "$LOCATION" --size "$VM_SIZE" \
             --query "[0].restrictions[].reasonCode" -o tsv 2>/dev/null || true)"
