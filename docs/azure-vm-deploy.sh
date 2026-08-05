@@ -447,13 +447,23 @@ write_files:
         # established that Baileys writes signal keys with a TTL, and
         # volatile-lru would evict them under pressure. Failing writes loudly
         # is better than losing keys quietly.
+        # appendfsync is `always`, not the usual `everysec`. With `everysec` up
+        # to one second of writes can be lost when Redis stops, and for this
+        # workload those writes are Baileys signal keys -- losing a Signal
+        # session produces "No session found to decrypt message" on the next
+        # inbound message from that contact, which is unrecoverable without the
+        # sender re-sending. Observed in practice: three group messages failed
+        # that way in the ten minutes after a VM restart (see the guide's
+        # section 13). A gateway writes a handful of small keys per message, so
+        # fsyncing every write costs nothing measurable here and makes the
+        # durability guarantee exact rather than "within one second".
         redis:
           command:
             - redis-server
             - --appendonly
             - "yes"
             - --appendfsync
-            - everysec
+            - always
             - --save
             - "900"
             - "1"

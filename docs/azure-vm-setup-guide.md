@@ -100,14 +100,16 @@ Here, Redis gets a named volume and AOF:
 
 ```yaml
 redis:
-  command: [redis-server, --appendonly, "yes", --appendfsync, everysec,
+  command: [redis-server, --appendonly, "yes", --appendfsync, always,
             --save, "900", "1", --maxmemory, 512mb, --maxmemory-policy, noeviction]
   volumes: [redis_data:/data]
 ```
 
+`appendfsync always`, not the conventional `everysec`. With `everysec`, up to one second of writes can be lost when Redis stops — and here those writes are Signal sessions. Losing one produces `No session found to decrypt message` for the next inbound message from that contact, which cannot be recovered without the sender re-sending. That was observed in practice (§13). A gateway writes a handful of small keys per message, so fsyncing every write costs nothing measurable and makes the guarantee exact rather than "within one second".
+
 `noeviction`, not `volatile-lru`: it is not established that Baileys writes signal keys with a TTL, and `volatile-lru` would evict them under memory pressure. Failing writes loudly beats losing keys quietly.
 
-**Measured, not assumed:** a linked instance survived a full VM restart with all 848 signal-key fields intact, `state: open`, and zero decryption errors — no re-scan needed. See §13.
+**Measured, not assumed:** a linked instance survived a full VM restart with all 848 signal-key fields intact and `state: open` — no re-scan needed. Three group messages did fail with `No session found` in the ten minutes afterwards, which is why `appendfsync` is now `always`. Both results in §13.
 
 The Container Apps guide's §13.2 — never scale past one replica, never scale to zero — is structurally satisfied: one container, no scaler, no HTTP-triggered wake-up to get wrong.
 
@@ -314,13 +316,38 @@ A linked instance with real traffic was carried through a full `az vm restart`. 
 | `Message` rows | 1470 | 1470 |
 | `Session` (credentials) | 1 | 1 |
 | `connectionState` | `open` | **`open`** |
-| decryption errors | 0 | **0** |
+| `Bad MAC` errors | 0 | **0** |
+| `failed to decrypt` | 0 | **3** — see below |
 | TLS | valid | **valid, cert reused from `caddy_data` — no re-issue** |
 | swapfile | 2 GiB | 2 GiB (fstab entry held) |
 
 All five containers returned unattended within ~20 s of boot via `restart: unless-stopped`, and the API logged `Auto-connecting instance … (status: open)` — credentials recovered from Postgres, signal keys from the Redis AOF. Redis reported `aof_enabled:1`, `aof_last_write_status:ok`, `loading:0`.
 
-This is the case that breaks the Container Apps design: there the same restart destroys the ephemeral sidecar's signal keys while the session still reports `open` and the phone still shows the device linked, so inbound messages stop decrypting with no visible cause. Here it is structurally impossible.
+This is the case that breaks the Container Apps design: there the same restart destroys the ephemeral sidecar's signal keys while the session still reports `open` and the phone still shows the device linked, so inbound messages stop decrypting with no visible cause. Here the session and its keys survive.
+
+#### The three failures, stated plainly
+
+In the ten minutes after that reboot, three inbound messages did fail:
+
+```
+01:48:59Z  boot
+01:54:03Z  failed to decrypt   No session found to decrypt message
+01:56:08Z  failed to decrypt   No session found to decrypt message
+01:58:28Z  failed to decrypt   No session found to decrypt message
+```
+
+All three were in one group, from three different participants. In the same window 15 group messages arrived and 12 decrypted; that group has 34 messages decrypted in total. `Bad MAC` and `waiting for this message` stayed at 0, `Stream Errored` at 0, no logout, and sender-key material *grew* (12 → 20 fields), so keys were being written and persisted normally.
+
+**This is not §13.1's failure mode**, which is `Bad MAC` across all inbound traffic while `state` reads `open`. `No session found` means the 1:1 Signal session with that specific participant was absent, so their sender-key distribution message could not be opened.
+
+**The cause was not conclusively established.** Two candidate explanations:
+
+1. `appendfsync everysec` (the setting at the time) can lose up to one second of writes when Redis stops. `bgrewriteaof` was run immediately before a graceful restart, so the window was small but non-zero, and a Signal session written in that final second would produce exactly this error.
+2. Ordinary WhatsApp behaviour for group participants with whom no direct session exists — this happens without any reboot.
+
+Candidate 1 has been eliminated going forward by switching to `appendfsync always` (§4). If `No session found` appears again **without** a restart, the cause is candidate 2 and nothing is wrong. If it only ever follows restarts, the fsync change addresses it. Watch with `azure-vm-deploy.sh logs`.
+
+Either way the practical impact is bounded: individual messages from participants whose session is missing are unreadable until the sender re-sends. It is not session loss and does not require re-linking.
 
 One `conflict`/`device_removed` event does appear in that deployment's log, timestamped ~16 hours *before* the reboot, during the initial linking window — consistent with a superseded first link. `Stream Errored` count was 0 and the session stayed continuously `open` through it. Worth knowing the signature: `device_removed` recurring **together with** `Stream Errored (conflict)` is the §13.2 tell that two things are presenting the same WhatsApp identity, which this single-container design should never produce on its own.
 
