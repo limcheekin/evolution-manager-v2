@@ -107,6 +107,8 @@ redis:
 
 `noeviction`, not `volatile-lru`: it is not established that Baileys writes signal keys with a TTL, and `volatile-lru` would evict them under memory pressure. Failing writes loudly beats losing keys quietly.
 
+**Measured, not assumed:** a linked instance survived a full VM restart with all 848 signal-key fields intact, `state: open`, and zero decryption errors — no re-scan needed. See §13.
+
 The Container Apps guide's §13.2 — never scale past one replica, never scale to zero — is structurally satisfied: one container, no scaler, no HTTP-triggered wake-up to get wrong.
 
 ---
@@ -301,9 +303,29 @@ Checked rather than recalled:
 - egress to `web.whatsapp.com` works — `GET /` populates `whatsappWebVersion`
 - `az vm run-command` does return the `[stdout]`/`[stderr]` framing `vm_run` parses
 
+### The reboot test — §4's durability claim, measured
+
+A linked instance with real traffic was carried through a full `az vm restart`. Nothing was re-scanned or re-linked.
+
+| Metric | Before | After |
+|---|---|---|
+| signal-key hash fields | 848 | **848** |
+| breakdown | 802 `pre-key`, 14 `lid-mapping`, 13 `session`, 12 `sender-key`, 3 `tctoken` | unchanged |
+| `Message` rows | 1470 | 1470 |
+| `Session` (credentials) | 1 | 1 |
+| `connectionState` | `open` | **`open`** |
+| decryption errors | 0 | **0** |
+| TLS | valid | **valid, cert reused from `caddy_data` — no re-issue** |
+| swapfile | 2 GiB | 2 GiB (fstab entry held) |
+
+All five containers returned unattended within ~20 s of boot via `restart: unless-stopped`, and the API logged `Auto-connecting instance … (status: open)` — credentials recovered from Postgres, signal keys from the Redis AOF. Redis reported `aof_enabled:1`, `aof_last_write_status:ok`, `loading:0`.
+
+This is the case that breaks the Container Apps design: there the same restart destroys the ephemeral sidecar's signal keys while the session still reports `open` and the phone still shows the device linked, so inbound messages stop decrypting with no visible cause. Here it is structurally impossible.
+
+One `conflict`/`device_removed` event does appear in that deployment's log, timestamped ~16 hours *before* the reboot, during the initial linking window — consistent with a superseded first link. `Stream Errored` count was 0 and the session stayed continuously `open` through it. Worth knowing the signature: `device_removed` recurring **together with** `Stream Errored (conflict)` is the §13.2 tell that two things are presenting the same WhatsApp identity, which this single-container design should never produce on its own.
+
 **Still not verified:**
 
 - egress volume, and therefore whether the 100 GB/month free allowance holds
 - a restore from any backup (backup was declined on this deployment)
-- behaviour across a VM reboot — the §4 durability claim is structurally sound (named volume + AOF) but has not been exercised by an actual restart
-- long-term certificate renewal
+- certificate renewal at ~60 days — though the reboot showed `caddy_data` persists, which is the mechanism renewal depends on
