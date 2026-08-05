@@ -502,10 +502,38 @@ write_files:
     permissions: '0755'
     content: |
       #!/usr/bin/env bash
-      # Bring the stack up. Safe to re-run; used by cloud-init and by hand.
+      # Bring the stack up, or run any compose subcommand against both files.
+      # Safe to re-run; used by evolution-stack.service and by hand.
       set -euo pipefail
       cd @@APP_DIR@@
-      exec docker compose -f docker-compose.yml -f docker-compose.prod.yml "${@:-up -d}"
+      # Default to `up -d` when called with no arguments. Note that
+      # "${@:-up -d}" does NOT work here: with $@ empty it expands to the single
+      # argument "up -d", which docker compose rejects as one unknown command.
+      if [ $# -eq 0 ]; then set -- up -d; fi
+      exec docker compose -f docker-compose.yml -f docker-compose.prod.yml "$@"
+
+  # Reconcile the running containers with the compose files on every boot.
+  #
+  # `restart: unless-stopped` brings containers back after a reboot, but it does
+  # `docker start`, which reuses each container's command and environment as
+  # baked in at CREATION time. So an edit to docker-compose.prod.yml silently
+  # does not take effect across a reboot -- the file says one thing and the
+  # running container does another. `docker compose up -d` recreates only the
+  # services whose config actually changed, so this is a no-op on an unchanged
+  # boot and a config apply otherwise.
+  - path: /etc/systemd/system/evolution-stack.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Reconcile the Evolution stack with its compose files
+      Requires=docker.service
+      After=docker.service network-online.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/evolution-up up -d
+      [Install]
+      WantedBy=multi-user.target
 
 runcmd:
   - systemctl enable --now evolution-swap.service
@@ -519,6 +547,7 @@ runcmd:
   - printf 'POSTGRES_PASSWORD=%s\nAUTHENTICATION_API_KEY=%s\n' '@@PG_PASSWORD@@' '@@API_KEY@@' > @@APP_DIR@@/.env
   - @@ACR_LOGIN@@
   - cd @@APP_DIR@@ && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+  - systemctl enable evolution-stack.service
   - touch /var/lib/cloud/evolution-stack-started
 CLOUDINIT
 
