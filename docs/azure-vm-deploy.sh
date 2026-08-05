@@ -294,8 +294,21 @@ phase_1() {
 
 nsg_rule() {
   local name="$1" prio="$2" port="$3" src="$4"
-  if exists az network nsg rule show -g "$RG" --nsg-name "$NSG_NAME" -n "$name"; then
-    ok "rule $name exists"
+  # An existing rule is not necessarily a correct one. A residential/ISP public
+  # IP changes, and the SSH rule then allows an address that is no longer yours
+  # while phase 1 reports "exists" and re-running it heals nothing. Compare the
+  # source and update in place when it has drifted.
+  local cur
+  cur="$(az network nsg rule show -g "$RG" --nsg-name "$NSG_NAME" -n "$name" \
+          --query sourceAddressPrefix -o tsv 2>/dev/null || true)"
+  if [[ -n "$cur" ]]; then
+    if [[ "$cur" == "$src" ]]; then
+      ok "rule $name exists (source $cur)"
+    else
+      az network nsg rule update -g "$RG" --nsg-name "$NSG_NAME" -n "$name" \
+        --source-address-prefixes "$src" -o none
+      ok "rule $name source updated: $cur -> $src"
+    fi
   else
     az network nsg rule create -g "$RG" --nsg-name "$NSG_NAME" -n "$name" \
       --priority "$prio" --access Allow --protocol Tcp --direction Inbound \
