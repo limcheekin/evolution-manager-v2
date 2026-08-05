@@ -260,7 +260,58 @@ sudo evolution-up logs -f evolution-api
 sudo evolution-up up -d --build         # after a git pull
 ```
 
-Your public IP changing locks you out of SSH. Update `ADMIN_SOURCE_IP` in `.env.vm` and re-run phase 1; `az vm run-command` (used by `logs` and `verify`) works regardless, because it goes through the Azure control plane rather than port 22.
+Your public IP changing locks you out of SSH. Update `ADMIN_SOURCE_IP` in `.env.vm` and re-run phase 1 — `nsg_rule()` compares the rule's source against the wanted value and updates it in place, so re-running actually heals the drift. `az vm run-command` (used by `logs` and `verify`) works regardless, because it goes through the Azure control plane rather than port 22.
+
+### Rebuilding the VM without re-linking WhatsApp
+
+Prefer this over patching a running box by hand. Applying config changes in place leaves the compose files and the running containers disagreeing — `restart: unless-stopped` does `docker start`, which reuses each container's *creation-time* command, so a `CONFIG SET` or a hand-edited file is not what comes back after a reboot. Rebuilding makes the script the single source of truth. `evolution-stack.service` now reconciles on every boot, but a rebuild is still the honest way to apply anything structural.
+
+All durable state lives in three Docker volumes. Move those and the session survives onto a completely different VM — no QR re-scan.
+
+| Volume | Holds | Why it matters |
+|---|---|---|
+| `evolution_postgres_data` | credentials (`Session`), instances, message history | without it the instance is gone |
+| `evolution_redis_data` | Baileys signal keys (AOF) | without it inbound messages fail to decrypt |
+| `evolution_caddy_data` | the issued TLS certificate | avoids a re-issue and Let's Encrypt rate limits |
+
+Keep `.env.vm` and `.secrets.vm` unchanged — the restored Postgres cluster still expects the *old* `POSTGRES_PASSWORD`, and reusing the same `DNS_LABEL` keeps both the hostname and the restored certificate valid.
+
+```bash
+IP=$(az network public-ip show -g evolution-vm-rg -n evolution-ip --query ipAddress -o tsv)
+
+# 1. On the old VM: stop cleanly so Postgres is consistent, then archive.
+ssh azureuser@$IP "sudo /usr/local/bin/evolution-up stop"
+ssh azureuser@$IP "sudo tar czf /tmp/evo-data.tgz -C /var/lib/docker/volumes \
+  evolution_postgres_data evolution_redis_data evolution_caddy_data && sudo chmod 644 /tmp/evo-data.tgz"
+scp azureuser@$IP:/tmp/evo-data.tgz .
+ssh azureuser@$IP "sha256sum /tmp/evo-data.tgz"; sha256sum evo-data.tgz   # must match
+
+# 2. Delete only the VM, NIC and OS disk. Keep the public IP, NSG and vnet so
+#    the hostname -- and therefore the restored certificate -- stay valid.
+disk=$(az vm show -g evolution-vm-rg -n evolution-vm --query 'storageProfile.osDisk.name' -o tsv)
+az vm delete -g evolution-vm-rg -n evolution-vm --yes
+az network nic delete -g evolution-vm-rg -n evolution-vmVMNic
+az disk delete -g evolution-vm-rg -n "$disk" --yes
+
+# 3. Rebuild from the script and let cloud-init finish.
+bash docs/azure-vm-deploy.sh 2
+bash docs/azure-vm-deploy.sh 3
+
+# 4. Restore over the fresh, empty volumes.
+ssh-keygen -R $IP                      # the rebuilt VM has a new host key
+scp evo-data.tgz azureuser@$IP:/tmp/
+ssh azureuser@$IP "sudo /usr/local/bin/evolution-up stop"
+ssh azureuser@$IP "sudo rm -rf /var/lib/docker/volumes/evolution_{postgres,redis,caddy}_data \
+  && sudo tar xzf /tmp/evo-data.tgz -C /var/lib/docker/volumes"
+ssh azureuser@$IP "sudo /usr/local/bin/evolution-up"
+
+# 5. Confirm the migration was exact, then verify.
+bash docs/azure-vm-deploy.sh verify
+```
+
+Compare row counts and `hlen` on the signal-key hash before and after; they should be identical, and `connectionState` should return `open` with no QR. Measured on a real rebuild: 1491 messages, 1 `Session`, 1 `Instance` and 880 signal-key fields all carried over unchanged, `state: open`, certificate reused (`ssl_verify_result=0`).
+
+The archive contains your WhatsApp credentials and signal keys in cleartext. Delete both copies afterwards.
 
 ---
 
@@ -348,6 +399,20 @@ All three were in one group, from three different participants. In the same wind
 Candidate 1 has been eliminated going forward by switching to `appendfsync always` (§4). If `No session found` appears again **without** a restart, the cause is candidate 2 and nothing is wrong. If it only ever follows restarts, the fsync change addresses it. Watch with `azure-vm-deploy.sh logs`.
 
 Either way the practical impact is bounded: individual messages from participants whose session is missing are unreadable until the sender re-sends. It is not session loss and does not require re-linking.
+
+### The from-scratch rebuild
+
+The whole stack was then rebuilt from this script onto a new VM, with the session migrated per §11 rather than re-linked. This deployment is therefore exactly what the script produces from a clean slate, with no accumulated hand-patches.
+
+Confirmed on the rebuilt VM:
+
+- `appendfsync always` is **baked into the container command**, not merely set at runtime — `Config.Cmd` shows it. On the previous VM the baked command still read `everysec`, so a reboot would have silently reverted the change while `config get` had reported `always` beforehand.
+- `evolution-stack.service` is `enabled`, so compose config is reconciled on every boot.
+- `evolution-up` with no arguments works.
+- Migration was exact: 1491 messages, 1 `Session`, 1 `Instance`, 880 signal-key fields, `state: open`, certificate reused with no ACME re-issue. Archive checksum matched at all three hops.
+- All 12 `verify` checks pass, and **zero** `Bad MAC` / `failed to decrypt` / `waiting for this message` — against 3 on the `everysec` deployment.
+
+That last comparison is suggestive, not conclusive: different traffic over a shorter window. But it is consistent with the fsync window having caused the three failures rather than ordinary group behaviour. If `No session found` never reappears under `always`, that is the answer.
 
 One `conflict`/`device_removed` event does appear in that deployment's log, timestamped ~16 hours *before* the reboot, during the initial linking window — consistent with a superseded first link. `Stream Errored` count was 0 and the session stayed continuously `open` through it. Worth knowing the signature: `device_removed` recurring **together with** `Stream Errored (conflict)` is the §13.2 tell that two things are presenting the same WhatsApp identity, which this single-container design should never produce on its own.
 
